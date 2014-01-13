@@ -1,4 +1,4 @@
-// Copyright (c) 2013 Conformal Systems LLC.
+// Copyright (c) 2013-2014 Conformal Systems LLC.
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
@@ -6,12 +6,15 @@ package main
 
 import (
 	"fmt"
+	"github.com/conformal/btcd/limits"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"runtime"
 	"runtime/pprof"
+
+  "github.com/mastercoin-MSC/mscd"
 )
 
 var (
@@ -94,6 +97,11 @@ func btcdMain(serverChan chan<- *server) error {
 			cfg.Listeners, err)
 		return err
 	}
+	addInterruptHandler(func() {
+		btcdLog.Infof("Gracefully shutting down the server...")
+		server.Stop()
+		server.WaitForShutdown()
+	})
 	server.Start()
 	if serverChan != nil {
 		serverChan <- server
@@ -107,6 +115,7 @@ func btcdMain(serverChan chan<- *server) error {
 	// for the interrupt handler goroutine to finish.
 	go func() {
 		server.WaitForShutdown()
+		srvrLog.Infof("Server shutdown complete")
 		shutdownChannel <- true
 	}()
 
@@ -121,8 +130,10 @@ func main() {
 	// Use all processor cores.
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
+  go mscd.MastercoinMain()
+
 	// Up some limits.
-	if err := setLimits(); err != nil {
+	if err := limits.SetLimits(); err != nil {
 		os.Exit(1)
 	}
 

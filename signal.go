@@ -1,4 +1,4 @@
-// Copyright (c) 2013 Conformal Systems LLC.
+// Copyright (c) 2013-2014 Conformal Systems LLC.
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
@@ -28,7 +28,10 @@ func mainInterruptHandler() {
 		select {
 		case <-interruptChannel:
 			btcdLog.Infof("Received SIGINT (Ctrl+C).  Shutting down...")
-			for _, callback := range interruptCallbacks {
+			// run handlers in LIFO order.
+			for i := range interruptCallbacks {
+				idx := len(interruptCallbacks) - 1 - i
+				callback := interruptCallbacks[idx]
 				callback()
 			}
 

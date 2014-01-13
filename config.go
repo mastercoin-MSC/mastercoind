@@ -1,16 +1,18 @@
-// Copyright (c) 2013 Conformal Systems LLC.
+// Copyright (c) 2013-2014 Conformal Systems LLC.
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
 package main
 
 import (
+	"errors"
 	"fmt"
 	"github.com/conformal/btcdb"
 	_ "github.com/conformal/btcdb/ldb"
 	"github.com/conformal/btcutil"
 	"github.com/conformal/btcwire"
 	"github.com/conformal/go-flags"
+	"github.com/conformal/go-socks"
 	"net"
 	"os"
 	"path/filepath"
@@ -67,10 +69,14 @@ type config struct {
 	RPCKey             string        `long:"rpckey" description:"File containing the certificate key"`
 	DisableRPC         bool          `long:"norpc" description:"Disable built-in RPC server -- NOTE: The RPC server is disabled by default if no rpcuser/rpcpass is specified"`
 	DisableDNSSeed     bool          `long:"nodnsseed" description:"Disable DNS seeding for peers"`
+	ExternalIPs        []string      `long:"externalip" description:"Add an ip to the list of local addresses we claim to listen on to peers"`
 	Proxy              string        `long:"proxy" description:"Connect via SOCKS5 proxy (eg. 127.0.0.1:9050)"`
 	ProxyUser          string        `long:"proxyuser" description:"Username for proxy server"`
 	ProxyPass          string        `long:"proxypass" default-mask:"-" description:"Password for proxy server"`
-	UseTor             bool          `long:"tor" description:"Specifies the proxy server used is a Tor node"`
+	OnionProxy         string        `long:"onion" description:"Connect to tor hidden services via SOCKS5 proxy (eg. 127.0.0.1:9050)"`
+	OnionProxyUser     string        `long:"onionuser" description:"Username for onion proxy server"`
+	OnionProxyPass     string        `long:"onionpass" default-mask:"-" description:"Password for onion proxy server"`
+	NoOnion            bool          `long:"noonion" description:"Disable connecting to tor hidden services"`
 	TestNet3           bool          `long:"testnet" description:"Use the test network"`
 	RegressionTest     bool          `long:"regtest" description:"Use the regression test network"`
 	DisableCheckpoints bool          `long:"nocheckpoints" description:"Disable built-in checkpoints.  Don't do this unless you know what you're doing."`
@@ -78,6 +84,11 @@ type config struct {
 	Profile            string        `long:"profile" description:"Enable HTTP profiling on given port -- NOTE port must be between 1024 and 65536"`
 	CpuProfile         string        `long:"cpuprofile" description:"Write CPU profile to the specified file"`
 	DebugLevel         string        `short:"d" long:"debuglevel" description:"Logging level for all subsystems {trace, debug, info, warn, error, critical} -- You may also specify <subsystem>=<level>,<subsystem2>=<level>,... to set the log level for individual subsystems -- Use show to list available subsystems"`
+	Upnp               bool          `long:"upnp" description:"Use UPnP to map our listening port outside of NAT"`
+	onionlookup        func(string) ([]net.IP, error)
+	lookup             func(string) ([]net.IP, error)
+	oniondial          func(string, string) (net.Conn, error)
+	dial               func(string, string) (net.Conn, error)
 }
 
 // serviceOptions defines the configuration options for btcd as a service on
@@ -420,15 +431,6 @@ func loadConfig() (*config, []string, error) {
 		return nil, nil, err
 	}
 
-	// --tor requires --proxy to be set.
-	if cfg.UseTor && cfg.Proxy == "" {
-		str := "%s: the --tor option requires --proxy to be set"
-		err := fmt.Errorf(str, "loadConfig")
-		fmt.Fprintln(os.Stderr, err)
-		parser.WriteHelp(os.Stderr)
-		return nil, nil, err
-	}
-
 	// --proxy or --connect without --listen disables listening.
 	if (cfg.Proxy != "" || len(cfg.ConnectPeers) > 0) &&
 		len(cfg.Listeners) == 0 {
@@ -485,12 +487,96 @@ func loadConfig() (*config, []string, error) {
 	cfg.ConnectPeers = normalizeAddresses(cfg.ConnectPeers,
 		activeNetParams.peerPort)
 
-	// Warn about missing config file after the final command line parse
-	// succeeds.  This prevents the warning on help messages and invalid
-	// options.
+	// Setup dial and DNS resolution (lookup) functions depending on the
+	// specified options.  The default is to use the standard net.Dial
+	// function as well as the system DNS resolver.  When a proxy is
+	// specified, the dial function is set to the proxy specific dial
+	// function and the lookup is set to use tor (unless --noonion is
+	// specified in which case the system DNS resolver is used).
+	cfg.dial = net.Dial
+	cfg.lookup = net.LookupIP
+	if cfg.Proxy != "" {
+		proxy := &socks.Proxy{
+			Addr:     cfg.Proxy,
+			Username: cfg.ProxyUser,
+			Password: cfg.ProxyPass,
+		}
+		cfg.dial = proxy.Dial
+		if !cfg.NoOnion {
+			cfg.lookup = func(host string) ([]net.IP, error) {
+				return torLookupIP(host, cfg.Proxy)
+			}
+		}
+	}
+
+	// Setup onion address dial and DNS resolution (lookup) functions
+	// depending on the specified options.  The default is to use the
+	// same dial and lookup functions selected above.  However, when an
+	// onion-specific proxy is specified, the onion address dial and
+	// lookup functions are set to use the onion-specific proxy while
+	// leaving the normal dial and lookup functions as selected above.
+	// This allows .onion address traffic to be routed through a different
+	// proxy than normal traffic.
+	if cfg.OnionProxy != "" {
+		cfg.oniondial = func(a, b string) (net.Conn, error) {
+			proxy := &socks.Proxy{
+				Addr:     cfg.OnionProxy,
+				Username: cfg.OnionProxyUser,
+				Password: cfg.OnionProxyPass,
+			}
+			return proxy.Dial(a, b)
+		}
+		cfg.onionlookup = func(host string) ([]net.IP, error) {
+			return torLookupIP(host, cfg.OnionProxy)
+		}
+	} else {
+		cfg.oniondial = cfg.dial
+		cfg.onionlookup = cfg.lookup
+	}
+
+	// Specifying --noonion means the onion address dial and DNS resolution
+	// (lookup) functions result in an error.
+	if cfg.NoOnion {
+		cfg.oniondial = func(a, b string) (net.Conn, error) {
+			return nil, errors.New("tor has been disabled")
+		}
+		cfg.onionlookup = func(a string) ([]net.IP, error) {
+			return nil, errors.New("tor has been disabled")
+		}
+	}
+
+	// Warn about missing config file only after all other configuration is
+	// done.  This prevents the warning on help messages and invalid
+	// options.  Note this should go directly before the return.
 	if configFileError != nil {
 		btcdLog.Warnf("%v", configFileError)
 	}
 
 	return &cfg, remainingArgs, nil
+}
+
+// btcdDial connects to the address on the named network using the appropriate
+// dial function depending on the address and configuration options.  For
+// example, .onion addresses will be dialed using the onion specific proxy if
+// one was specified, but will otherwise use the normal dial function (which
+// could itself use a proxy or not).
+func btcdDial(network, address string) (net.Conn, error) {
+	if strings.HasSuffix(address, ".onion") {
+		return cfg.oniondial(network, address)
+	}
+	return cfg.dial(network, address)
+}
+
+// btcdLookup returns the correct DNS lookup function to use depending on the
+// passed host and configuration options.  For example, .onion addresses will be
+// resolved using the onion specific proxy if one was specified, but will
+// otherwise treat the normal proxy as tor unless --noonion was specified in
+// which case the lookup will fail.  Meanwhile, normal IP addresses will be
+// resolved using tor if a proxy was specified unless --noonion was also
+// specified in which case the normal system DNS resolver will be used.
+func btcdLookup(host string) ([]net.IP, error) {
+	if strings.HasSuffix(host, ".onion") {
+		return cfg.onionlookup(host)
+	}
+	return cfg.lookup(host)
 }

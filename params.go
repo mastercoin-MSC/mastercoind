@@ -1,4 +1,4 @@
-// Copyright (c) 2013 Conformal Systems LLC.
+// Copyright (c) 2013-2014 Conformal Systems LLC.
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
@@ -49,6 +49,7 @@ var mainNetParams = params{
 		"seed.bitcoin.sipa.be",
 		"dnsseed.bluematt.me",
 		"dnsseed.bitcoin.dashjr.org",
+		"seed.bitcoinstats.com",
 		"bitseed.xf2.org",
 	},
 }

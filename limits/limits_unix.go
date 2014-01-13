@@ -1,10 +1,10 @@
-// Copyright (c) 2013 Conformal Systems LLC.
+// Copyright (c) 2013-2014 Conformal Systems LLC.
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
 // +build !windows,!plan9
 
-package main
+package limits
 
 import (
 	"fmt"
@@ -16,7 +16,7 @@ const (
 	fileLimitMin  = 1024
 )
 
-func setLimits() error {
+func SetLimits() error {
 	var rLimit syscall.Rlimit
 
 	err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit)

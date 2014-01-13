@@ -1,4 +1,4 @@
-// Copyright (c) 2013 Conformal Systems LLC.
+// Copyright (c) 2013-2014 Conformal Systems LLC.
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"container/list"
 	crand "crypto/rand" // for seeding
+	"encoding/base32"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -320,18 +322,20 @@ type knownAddress struct {
 // AddrManager provides a concurrency safe address manager for caching potential
 // peers on the bitcoin network.
 type AddrManager struct {
-	mtx       sync.Mutex
-	rand      *rand.Rand
-	key       [32]byte
-	addrIndex map[string]*knownAddress // address key to ka for all addrs.
-	addrNew   [newBucketCount]map[string]*knownAddress
-	addrTried [triedBucketCount]*list.List
-	started   int32
-	shutdown  int32
-	wg        sync.WaitGroup
-	quit      chan bool
-	nTried    int
-	nNew      int
+	mtx            sync.Mutex
+	rand           *rand.Rand
+	key            [32]byte
+	addrIndex      map[string]*knownAddress // address key to ka for all addrs.
+	addrNew        [newBucketCount]map[string]*knownAddress
+	addrTried      [triedBucketCount]*list.List
+	started        int32
+	shutdown       int32
+	wg             sync.WaitGroup
+	quit           chan bool
+	nTried         int
+	nNew           int
+	lamtx          sync.Mutex
+	localAddresses map[string]*localAddress
 }
 
 func (a *AddrManager) getNewBucket(netAddr, srcAddr *btcwire.NetAddress) int {
@@ -591,14 +595,12 @@ func deserialiseNetAddress(addr string) (*btcwire.NetAddress, error) {
 	if err != nil {
 		return nil, err
 	}
-	ip := net.ParseIP(host)
 	port, err := strconv.ParseUint(portStr, 10, 16)
 	if err != nil {
 		return nil, err
 	}
-	na := btcwire.NewNetAddressIPPort(ip, uint16(port),
-		btcwire.SFNodeNetwork)
-	return na, nil
+
+	return hostToNetAddress(host, uint16(port), btcwire.SFNodeNetwork)
 }
 
 // Start begins the core address handler which manages a pool of known
@@ -746,18 +748,63 @@ func (a *AddrManager) reset() {
 // Use Start to begin processing asynchronous address updates.
 func NewAddrManager() *AddrManager {
 	am := AddrManager{
-		rand: rand.New(rand.NewSource(time.Now().UnixNano())),
-		quit: make(chan bool),
+		rand:           rand.New(rand.NewSource(time.Now().UnixNano())),
+		quit:           make(chan bool),
+		localAddresses: make(map[string]*localAddress),
 	}
 	am.reset()
 	return &am
+}
+
+// hostToNetAddress returns a netaddress given a host address. If the address is
+// a tor .onion address this will be taken care of. else if the host is not an
+// IP address it will be resolved (via tor if required).
+func hostToNetAddress(host string, port uint16, services btcwire.ServiceFlag) (*btcwire.NetAddress, error) {
+	// tor address is 16 char base32 + ".onion"
+	var ip net.IP
+	if len(host) == 22 && host[16:] == ".onion" {
+		// go base32 encoding uses capitals (as does the rfc
+		// but tor and bitcoind tend to user lowercase, so we switch
+		// case here.
+		data, err := base32.StdEncoding.DecodeString(
+			strings.ToUpper(host[:16]))
+		if err != nil {
+			return nil, err
+		}
+		prefix := []byte{0xfd, 0x87, 0xd8, 0x7e, 0xeb, 0x43}
+		ip = net.IP(append(prefix, data...))
+	} else if ip = net.ParseIP(host); ip == nil {
+		ips, err := btcdLookup(host)
+		if err != nil {
+			return nil, err
+		}
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("No addresses found for %s", host)
+		}
+		ip = ips[0]
+	}
+
+	return btcwire.NewNetAddressIPPort(ip, port, services), nil
+}
+
+// ipString returns a string for the ip from the provided NetAddress. If the
+// ip is in the range used for tor addresses then it will be transformed into
+// the relavent .onion address.
+func ipString(na *btcwire.NetAddress) string {
+	if Tor(na) {
+		// We know now that na.IP is long enogh.
+		base32 := base32.StdEncoding.EncodeToString(na.IP[6:])
+		return strings.ToLower(base32) + ".onion"
+	} else {
+		return na.IP.String()
+	}
 }
 
 // NetAddressKey returns a string key in the form of ip:port for IPv4 addresses
 // or [ip]:port for IPv6 addresses.
 func NetAddressKey(na *btcwire.NetAddress) string {
 	port := strconv.FormatUint(uint64(na.Port), 10)
-	addr := net.JoinHostPort(na.IP.String(), port)
+	addr := net.JoinHostPort(ipString(na), port)
 	return addr
 }
 
@@ -1061,7 +1108,7 @@ func RFC6145(na *btcwire.NetAddress) bool {
 	return rfc6145.Contains(na.IP)
 }
 
-var onioncatrange = net.IPNet{IP: net.ParseIP("FD87:d87e:eb43"),
+var onioncatrange = net.IPNet{IP: net.ParseIP("FD87:d87e:eb43::"),
 	Mask: net.CIDRMask(48, 128)}
 
 func Tor(na *btcwire.NetAddress) bool {
@@ -1073,9 +1120,6 @@ func Tor(na *btcwire.NetAddress) bool {
 	// RFC4193 Unique local IPv6 range.
 	// In summary the format is:
 	// { magic 6 bytes, 10 bytes base32 decode of key hash }
-	// TODO(oga) note that when handling tor addresses we need to detect
-	// this and // connect correctly. We may want to print tor addresses
-	// specially too.
 	return onioncatrange.Contains(na.IP)
 }
 
@@ -1103,6 +1147,7 @@ func Valid(na *btcwire.NetAddress) bool {
 // not. This is true as long as the address is valid and is not in any reserved
 // ranges.
 func Routable(na *btcwire.NetAddress) bool {
+	// TODO(oga) bitcoind doesn't include RFC3849 here, but should we?
 	return Valid(na) && !(RFC1918(na) || RFC3927(na) || RFC4862(na) ||
 		(RFC4193(na) && !Tor(na)) || RFC4843(na) || Local(na))
 }
@@ -1161,4 +1206,143 @@ func GroupKey(na *btcwire.NetAddress) string {
 	}
 
 	return (&net.IPNet{IP: na.IP, Mask: net.CIDRMask(bits, 128)}).String()
+}
+
+// addressPrio is an enum type used to describe the heirarchy of local address
+// discovery methods.
+type addressPrio int
+
+const (
+	InterfacePrio addressPrio = iota // address of local interface.
+	BoundPrio                        // Address explicitly bound to.
+	UpnpPrio                         // External IP discovered from UPnP
+	HttpPrio                         // Obtained from internet service.
+	ManualPrio                       // provided by --externalip.
+)
+
+type localAddress struct {
+	na    *btcwire.NetAddress
+	score addressPrio
+}
+
+// addLocalAddress adds na to the list of known local addresses to advertise
+// with the given priority.
+func (a *AddrManager) addLocalAddress(na *btcwire.NetAddress,
+	priority addressPrio) {
+	// sanity check.
+	if !Routable(na) {
+		amgrLog.Debugf("rejecting address %s:%d due to routability",
+			na.IP, na.Port)
+		return
+	}
+	amgrLog.Debugf("adding address %s:%d",
+		na.IP, na.Port)
+
+	a.lamtx.Lock()
+	defer a.lamtx.Unlock()
+
+	key := NetAddressKey(na)
+	la, ok := a.localAddresses[key]
+	if !ok || la.score < priority {
+		if ok {
+			la.score = priority + 1
+		} else {
+			a.localAddresses[key] = &localAddress{
+				na:    na,
+				score: priority,
+			}
+		}
+	}
+}
+
+// getReachabilityFrom returns the relative reachability of na from fromna.
+func getReachabilityFrom(na, fromna *btcwire.NetAddress) int {
+	const (
+		Unreachable = 0
+		Default     = iota
+		Teredo
+		Ipv6_weak
+		Ipv4
+		Ipv6_strong
+		Private
+	)
+	if !Routable(fromna) {
+		return Unreachable
+	} else if Tor(fromna) {
+		if Tor(na) {
+			return Private
+		} else if Routable(na) && na.IP.To4() != nil {
+			return Ipv4
+		} else {
+			return Default
+		}
+	} else if RFC4380(fromna) {
+		if !Routable(na) {
+			return Default
+		} else if RFC4380(na) {
+			return Teredo
+		} else if na.IP.To4() != nil {
+			return Ipv4
+		} else { // ipv6
+			return Ipv6_weak
+		}
+	} else if fromna.IP.To4() != nil {
+		if Routable(na) && na.IP.To4() != nil {
+			return Ipv4
+		}
+		return Default
+	} else /* ipv6 */ {
+		var tunnelled bool
+		// Is our v6 is tunnelled?
+		if RFC3964(na) || RFC6052(na) || RFC6145(na) {
+			tunnelled = true
+		}
+		if !Routable(na) {
+			return Default
+		} else if RFC4380(na) {
+			return Teredo
+		} else if na.IP.To4() != nil {
+			return Ipv4
+		} else if tunnelled {
+			// only prioritise ipv6 if we aren't tunnelling it.
+			return Ipv6_weak
+		}
+		return Ipv6_strong
+	}
+}
+
+// getBestLocalAddress returns the most appropriate local address that we know
+// of to be contacted by rna
+func (a *AddrManager) getBestLocalAddress(rna *btcwire.NetAddress) *btcwire.NetAddress {
+	a.lamtx.Lock()
+	defer a.lamtx.Unlock()
+
+	bestreach := 0
+	var bestscore addressPrio
+	var bestna *btcwire.NetAddress
+	for _, la := range a.localAddresses {
+		reach := getReachabilityFrom(la.na, rna)
+		if reach > bestreach ||
+			(reach == bestreach && la.score > bestscore) {
+			bestreach = reach
+			bestscore = la.score
+			bestna = la.na
+		}
+	}
+	if bestna != nil {
+		amgrLog.Debugf("Suggesting address %s:%d for %s:%d",
+			bestna.IP, bestna.Port, rna.IP, rna.Port)
+	} else {
+		amgrLog.Debugf("No worthy address for %s:%d",
+			rna.IP, rna.Port)
+		// Send something unroutable if nothing suitable.
+		bestna = &btcwire.NetAddress{
+			Timestamp: time.Now(),
+			Services:  0,
+			IP:        net.IP([]byte{0, 0, 0, 0}),
+			Port:      0,
+		}
+	}
+
+	return bestna
 }

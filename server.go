@@ -1,4 +1,4 @@
-// Copyright (c) 2013 Conformal Systems LLC.
+// Copyright (c) 2013-2014 Conformal Systems LLC.
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
@@ -67,6 +67,7 @@ type server struct {
 	broadcast     chan broadcastMsg
 	wg            sync.WaitGroup
 	quit          chan bool
+	nat           NAT
 	db            btcdb.Db
 }
 
@@ -259,19 +260,19 @@ func (s *server) handleBroadcastMsg(state *peerState, bmsg *broadcastMsg) {
 
 // PeerInfo represents the information requested by the getpeerinfo rpc command.
 type PeerInfo struct {
-	Addr           string              `json:"addr,omitempty"`
-	Services       btcwire.ServiceFlag `json:"services,omitempty"`
-	LastSend       int64               `json:"lastsend,omitempty"`
-	LastRecv       int64               `json:"lastrecv,omitempty"`
-	BytesSent      int                 `json:"bytessent,omitempty"`
-	BytesRecv      int                 `json:"bytesrecv,omitempty"`
-	ConnTime       int64               `json:"conntime,omitempty"`
-	Version        uint32              `json:"version,omitempty"`
-	SubVer         string              `json:"subver,omitempty"`
-	Inbound        bool                `json:"inbound,omitempty"`
-	StartingHeight int32               `json:"startingheight,omitempty"`
-	BanScore       int                 `json:"banscore,omitempty"`
-	SyncNode       bool                `json:"syncnode,omitempty"`
+	Addr           string `json:"addr"`
+	Services       string `json:"services"`
+	LastSend       int64  `json:"lastsend"`
+	LastRecv       int64  `json:"lastrecv"`
+	BytesSent      int    `json:"bytessent"`
+	BytesRecv      int    `json:"bytesrecv"`
+	ConnTime       int64  `json:"conntime"`
+	Version        uint32 `json:"version"`
+	SubVer         string `json:"subver"`
+	Inbound        bool   `json:"inbound"`
+	StartingHeight int32  `json:"startingheight"`
+	BanScore       int    `json:"banscore,omitempty"`
+	SyncNode       bool   `json:"syncnode,omitempty"`
 }
 
 type getConnCountMsg struct {
@@ -319,7 +320,7 @@ func (s *server) handleQuery(querymsg interface{}, state *peerState) {
 			// version.
 			info := &PeerInfo{
 				Addr:           p.addr,
-				Services:       p.services,
+				Services:       fmt.Sprintf("%08d", p.services),
 				LastSend:       p.lastSend.Unix(),
 				LastRecv:       p.lastRecv.Unix(),
 				BytesSent:      0, // TODO(oga) we need this from wire.
@@ -406,12 +407,8 @@ func (s *server) seedFromDNS() {
 		return
 	}
 
-	proxy := ""
-	if cfg.Proxy != "" && cfg.UseTor {
-		proxy = cfg.Proxy
-	}
 	for _, seeder := range activeNetParams.dnsSeeds {
-		seedpeers := dnsDiscover(seeder, proxy)
+		seedpeers := dnsDiscover(seeder)
 		if len(seedpeers) == 0 {
 			continue
 		}
@@ -683,6 +680,10 @@ func (s *server) Start() {
 	// managers.
 	s.wg.Add(1)
 	go s.peerHandler()
+	if s.nat != nil {
+		s.wg.Add(1)
+		go s.upnpUpdateThread()
+	}
 
 	// Start the RPC server if it's not disabled.
 	if !cfg.DisableRPC {
@@ -723,7 +724,6 @@ func (s *server) Stop() error {
 // WaitForShutdown blocks until the main listener and peer handlers are stopped.
 func (s *server) WaitForShutdown() {
 	s.wg.Wait()
-	srvrLog.Infof("Server shutdown complete")
 }
 
 // ScheduleShutdown schedules a server shutdown after the specified duration.
@@ -771,28 +771,31 @@ func (s *server) ScheduleShutdown(duration time.Duration) {
 // listeners on the correct interface "tcp4" and "tcp6".  It also properly
 // detects addresses which apply to "all interfaces" and adds the address to
 // both slices.
-func parseListeners(addrs []string) ([]string, []string, error) {
+func parseListeners(addrs []string) ([]string, []string, bool, error) {
 	ipv4ListenAddrs := make([]string, 0, len(addrs)*2)
 	ipv6ListenAddrs := make([]string, 0, len(addrs)*2)
+	haveWildcard := false
+
 	for _, addr := range addrs {
 		host, _, err := net.SplitHostPort(addr)
 		if err != nil {
 			// Shouldn't happen due to already being normalized.
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 
 		// Empty host or host of * on plan9 is both IPv4 and IPv6.
 		if host == "" || (host == "*" && runtime.GOOS == "plan9") {
 			ipv4ListenAddrs = append(ipv4ListenAddrs, addr)
 			ipv6ListenAddrs = append(ipv6ListenAddrs, addr)
+			haveWildcard = true
 			continue
 		}
 
 		// Parse the IP.
 		ip := net.ParseIP(host)
 		if ip == nil {
-			return nil, nil, fmt.Errorf("'%s' is not a valid IP "+
-				"address", host)
+			return nil, nil, false, fmt.Errorf("'%s' is not a "+
+				"valid IP address", host)
 		}
 
 		// To4 returns nil when the IP is not an IPv4 address, so use
@@ -803,7 +806,58 @@ func parseListeners(addrs []string) ([]string, []string, error) {
 			ipv4ListenAddrs = append(ipv4ListenAddrs, addr)
 		}
 	}
-	return ipv4ListenAddrs, ipv6ListenAddrs, nil
+	return ipv4ListenAddrs, ipv6ListenAddrs, haveWildcard, nil
+}
+
+func (s *server) upnpUpdateThread() {
+	// Go off immediately to prevent code duplication, thereafter we renew
+	// lease every 15 minutes.
+	timer := time.NewTimer(0 * time.Second)
+	lport, _ := strconv.ParseInt(activeNetParams.listenPort, 10, 16)
+	first := true
+out:
+	for {
+		select {
+		case <-timer.C:
+			// TODO(oga) pick external port  more cleverly
+			// TODO(oga) know which ports we are listening to on an external net.
+			// TODO(oga) if specific listen port doesn't work then ask for wildcard
+			// listen port?
+			// XXX this assumes timeout is in seconds.
+			listenPort, err := s.nat.AddPortMapping("tcp", int(lport), int(lport),
+				"btcd listen port", 20*60)
+			if err != nil {
+				srvrLog.Warnf("can't add UPnP port mapping: %v", err)
+			}
+			if first && err == nil {
+				// TODO(oga): look this up periodically to see if upnp domain changed
+				// and so did ip.
+				externalip, err := s.nat.GetExternalAddress()
+				if err != nil {
+					srvrLog.Warnf("UPnP can't get external address: %v", err)
+					continue out
+				}
+				na := btcwire.NewNetAddressIPPort(externalip, uint16(listenPort),
+					btcwire.SFNodeNetwork)
+				s.addrManager.addLocalAddress(na, UpnpPrio)
+				srvrLog.Warnf("Successfully bound via UPnP to %s", NetAddressKey(na))
+				first = false
+			}
+			timer.Reset(time.Minute * 15)
+		case <-s.quit:
+			break out
+		}
+	}
+
+	timer.Stop()
+
+	if err := s.nat.DeletePortMapping("tcp", int(lport), int(lport)); err != nil {
+		srvrLog.Warnf("unable to remove UPnP port mapping: %v", err)
+	} else {
+		srvrLog.Debugf("succesfully disestablished UPnP port mapping")
+	}
+
+	s.wg.Done()
 }
 
 // newServer returns a new btcd server configured to listen on addr for the
@@ -815,13 +869,83 @@ func newServer(listenAddrs []string, db btcdb.Db, btcnet btcwire.BitcoinNet) (*s
 		return nil, err
 	}
 
+	amgr := NewAddrManager()
+
 	var listeners []net.Listener
+	var nat NAT
 	if !cfg.DisableListen {
-		ipv4Addrs, ipv6Addrs, err := parseListeners(listenAddrs)
+		ipv4Addrs, ipv6Addrs, wildcard, err :=
+			parseListeners(listenAddrs)
 		if err != nil {
 			return nil, err
 		}
 		listeners = make([]net.Listener, 0, len(ipv4Addrs)+len(ipv6Addrs))
+		discover := true
+		if len(cfg.ExternalIPs) != 0 {
+			discover = false
+			// if this fails we have real issues.
+			port, _ := strconv.ParseUint(
+				activeNetParams.listenPort, 10, 16)
+
+			for _, sip := range cfg.ExternalIPs {
+				eport := uint16(port)
+				host, portstr, err := net.SplitHostPort(sip)
+				if err != nil {
+					// no port, use default.
+					host = sip
+				} else {
+					port, err := strconv.ParseUint(
+						portstr, 10, 16)
+					if err != nil {
+						srvrLog.Warnf("Can not parse "+
+							"port from %s for "+
+							"externalip: %v", sip,
+							err)
+						continue
+					}
+					eport = uint16(port)
+				}
+				na, err := hostToNetAddress(host, eport,
+					btcwire.SFNodeNetwork)
+				if err != nil {
+					srvrLog.Warnf("Not adding %s as "+
+						"externalip: %v", sip, err)
+					continue
+				}
+
+				amgr.addLocalAddress(na, ManualPrio)
+			}
+		} else if discover && cfg.Upnp {
+			nat, err = Discover()
+			if err != nil {
+				srvrLog.Warnf("Can't discover upnp: %v", err)
+			}
+			// nil nat here is fine, just means no upnp on network.
+		}
+
+		// TODO(oga) nonstandard port...
+		if wildcard {
+			port, err :=
+				strconv.ParseUint(activeNetParams.listenPort,
+					10, 16)
+			if err != nil {
+				// I can't think of a cleaner way to do this...
+				goto nowc
+			}
+			addrs, err := net.InterfaceAddrs()
+			for _, a := range addrs {
+				ip, _, err := net.ParseCIDR(a.String())
+				if err != nil {
+					continue
+				}
+				na := btcwire.NewNetAddressIPPort(ip,
+					uint16(port), btcwire.SFNodeNetwork)
+				if discover {
+					amgr.addLocalAddress(na, InterfacePrio)
+				}
+			}
+		}
+	nowc:
 
 		for _, addr := range ipv4Addrs {
 			listener, err := net.Listen("tcp4", addr)
@@ -831,6 +955,12 @@ func newServer(listenAddrs []string, db btcdb.Db, btcnet btcwire.BitcoinNet) (*s
 				continue
 			}
 			listeners = append(listeners, listener)
+
+			if discover {
+				if na, err := deserialiseNetAddress(addr); err == nil {
+					amgr.addLocalAddress(na, BoundPrio)
+				}
+			}
 		}
 
 		for _, addr := range ipv6Addrs {
@@ -841,6 +971,11 @@ func newServer(listenAddrs []string, db btcdb.Db, btcnet btcwire.BitcoinNet) (*s
 				continue
 			}
 			listeners = append(listeners, listener)
+			if discover {
+				if na, err := deserialiseNetAddress(addr); err == nil {
+					amgr.addLocalAddress(na, BoundPrio)
+				}
+			}
 		}
 
 		if len(listeners) == 0 {
@@ -852,7 +987,7 @@ func newServer(listenAddrs []string, db btcdb.Db, btcnet btcwire.BitcoinNet) (*s
 		nonce:       nonce,
 		listeners:   listeners,
 		btcnet:      btcnet,
-		addrManager: NewAddrManager(),
+		addrManager: amgr,
 		newPeers:    make(chan *peer, cfg.MaxPeers),
 		donePeers:   make(chan *peer, cfg.MaxPeers),
 		banPeers:    make(chan *peer, cfg.MaxPeers),
@@ -861,6 +996,7 @@ func newServer(listenAddrs []string, db btcdb.Db, btcnet btcwire.BitcoinNet) (*s
 		relayInv:    make(chan *btcwire.InvVect, cfg.MaxPeers),
 		broadcast:   make(chan broadcastMsg, cfg.MaxPeers),
 		quit:        make(chan bool),
+		nat:         nat,
 		db:          db,
 	}
 	bm, err := newBlockManager(&s)
