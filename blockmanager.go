@@ -18,7 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
-  "github.com/mastercoin-MSC/mscd"
+	"github.com/mastercoin-MSC/mscd"
 )
 
 const (
@@ -254,7 +254,7 @@ func (b *blockManager) handleDonePeerMsg(peers *list.List, p *peer) {
 	// Attempt to find a new peer to sync from if the quitting peer is the
 	// sync peer.
 	if b.syncPeer != nil && b.syncPeer == p {
-		if b.fetchingHeaders  {
+		if b.fetchingHeaders {
 			b.fetchingHeaders = false
 			b.startBlock = nil
 			b.fetchBlock = nil
@@ -472,9 +472,8 @@ func (b *blockManager) handleBlockMsg(bmsg *blockMsg) {
 	b.logBlockHeight(int64(len(bmsg.block.MsgBlock().Transactions)), height,
 		latestHash)
 
-
-    // MSCHOOK
-  mscd.QueueMessageForBlockChannel(bmsg.block)
+	// MSCHOOK
+	mscd.QueueMessageForBlockChannel(bmsg.block)
 
 	// Sync the db to disk.
 	b.server.db.Sync()

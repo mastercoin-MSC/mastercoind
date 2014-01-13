@@ -14,7 +14,7 @@ import (
 	"runtime"
 	"runtime/pprof"
 
-  "github.com/mastercoin-MSC/mscd"
+	"github.com/mastercoin-MSC/mscd"
 )
 
 var (
@@ -130,7 +130,7 @@ func main() {
 	// Use all processor cores.
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-  go mscd.MastercoinMain()
+	go mscd.MastercoinMain()
 
 	// Up some limits.
 	if err := limits.SetLimits(); err != nil {
