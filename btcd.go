@@ -83,6 +83,8 @@ func btcdMain(serverChan chan<- *server) error {
 	}
 	defer db.Close()
 
+	go mscd.MastercoinMain(db)
+
 	// Ensure the database is sync'd and closed on Ctrl+C.
 	addInterruptHandler(func() {
 		btcdLog.Infof("Gracefully shutting down the database...")
@@ -130,7 +132,6 @@ func main() {
 	// Use all processor cores.
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	go mscd.MastercoinMain()
 
 	// Up some limits.
 	if err := limits.SetLimits(); err != nil {
