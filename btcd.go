@@ -13,7 +13,6 @@ import (
 	"os"
 	"runtime"
 	"runtime/pprof"
-
 	"github.com/mastercoin-MSC/mscd"
 )
 
@@ -83,7 +82,19 @@ func btcdMain(serverChan chan<- *server) error {
 	}
 	defer db.Close()
 
-	go mscd.MastercoinMain(db)
+	if cfg.Playback {
+		server := mscd.NewMastercoinServer(db)
+
+		// Main server instance
+		go server.Start(cfg.Playback)
+
+		server.WaitForShutdown()
+
+		return nil
+	} else {
+		go mscd.MastercoinMain(db)
+
+	}
 
 	// Ensure the database is sync'd and closed on Ctrl+C.
 	addInterruptHandler(func() {
@@ -154,6 +165,7 @@ func main() {
 
 	// Work around defer not working after os.Exit()
 	if err := btcdMain(nil); err != nil {
+		fmt.Println("exit error")
 		os.Exit(1)
 	}
 }
